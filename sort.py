@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from skimage import io
-from sklearn.utils.linear_assignment_ import linear_assignment
+from sklearn.utils import linear_assignment_
 import glob
 import time
 import argparse
@@ -31,19 +31,30 @@ from filterpy.kalman import KalmanFilter
 
 @jit
 def iou(bb_test,bb_gt):
+  """Computes IUO between two bboxes in the form [x1,y1,x2,y2]
+
+  Parameters
+  ----------
+  bb_test : list of int
+    [x1,y1,x2,y2]
+  bb_gt : list of int
+    [x1,y1,x2,y2]
   """
-  Computes IUO between two bboxes in the form [x1,y1,x2,y2]
-  """
+  # intersectin
   xx1 = np.maximum(bb_test[0], bb_gt[0])
   yy1 = np.maximum(bb_test[1], bb_gt[1])
   xx2 = np.minimum(bb_test[2], bb_gt[2])
   yy2 = np.minimum(bb_test[3], bb_gt[3])
   w = np.maximum(0., xx2 - xx1)
   h = np.maximum(0., yy2 - yy1)
-  wh = w * h
-  o = wh / ((bb_test[2]-bb_test[0])*(bb_test[3]-bb_test[1])
-    + (bb_gt[2]-bb_gt[0])*(bb_gt[3]-bb_gt[1]) - wh)
-  return(o)
+  # calculate intersection area
+  area = w * h
+  # bb_test area
+  bb_test_area = (bb_test[2]-bb_test[0])*(bb_test[3]-bb_test[1])
+  # bb_gt area
+  bb_gt_area = (bb_gt[2]-bb_gt[0])*(bb_gt[3]-bb_gt[1])
+  _iou = area / (bb_test_area + bb_gt_area - area)
+  return _iou
 
 def convert_bbox_to_z(bbox):
   """
@@ -63,6 +74,12 @@ def convert_x_to_bbox(x,score=None):
   """
   Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
     [x1,y1,x2,y2] where x1,y1 is the top left and x2,y2 is the bottom right
+
+  Parameters
+  ----------
+  x :
+
+  score :
   """
   w = np.sqrt(x[2]*x[3])
   h = x[2]/w
@@ -82,17 +99,49 @@ class KalmanBoxTracker(object):
     Initialises a tracker using initial bounding box.
     """
     #define constant velocity model
+    # dim_x : 7
+    #   u     : x of the bbox center
+    #   v     : y of the bbox center
+    #   s     : bbox area
+    #   r     : aspect ratio (constant)
+    #   du/dt : x velocity of the bbox center
+    #   dv/dt : y velocity of the bbox center
+    #   ds/dt : bbox area velocity
+    # dim_z : 4
+    #   direct observations
+    #   u     : x of the bbox center
+    #   v     : y of the bbox center
+    #   s     : bbox area
+    #   r     : aspect ratio (constant)
     self.kf = KalmanFilter(dim_x=7, dim_z=4)
-    self.kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],  [0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
-    self.kf.H = np.array([[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[0,0,0,1,0,0,0]])
+    # state transistion matrix
+    self.kf.F = np.array([[1,0,0,0,1,0,0],
+                          [0,1,0,0,0,1,0],
+                          [0,0,1,0,0,0,1],
+                          [0,0,0,1,0,0,0],
+                          [0,0,0,0,1,0,0],
+                          [0,0,0,0,0,1,0],
+                          [0,0,0,0,0,0,1]])
+    # measurement function
+    self.kf.H = np.array([[1,0,0,0,0,0,0],
+                          [0,1,0,0,0,0,0],
+                          [0,0,1,0,0,0,0],
+                          [0,0,0,1,0,0,0]])
 
+    # measurement uncertainty/noise (default eye(dim_x))
     self.kf.R[2:,2:] *= 10.
-    self.kf.P[4:,4:] *= 1000. #give high uncertainty to the unobservable initial velocities
+    # covariance matrix (default: eye(dim_x))
+    # give high uncertainty to the unobservable initial velocities
+    # velocity : du/dt, dv/dt, ds/dt
+    self.kf.P[4:,4:] *= 1000.
     self.kf.P *= 10.
+    # Process uncertainty/noise (default eye(dim_x))
     self.kf.Q[-1,-1] *= 0.01
     self.kf.Q[4:,4:] *= 0.01
 
+    # filter state estimate
     self.kf.x[:4] = convert_bbox_to_z(bbox)
+
     self.time_since_update = 0
     self.id = KalmanBoxTracker.count
     KalmanBoxTracker.count += 1
@@ -109,7 +158,7 @@ class KalmanBoxTracker(object):
     self.history = []
     self.hits += 1
     self.hit_streak += 1
-    self.kf.update(convert_bbox_to_z(bbox))
+    self.kf.update(z=convert_bbox_to_z(bbox))
 
   def predict(self):
     """
@@ -119,7 +168,7 @@ class KalmanBoxTracker(object):
       self.kf.x[6] *= 0.0
     self.kf.predict()
     self.age += 1
-    if(self.time_since_update>0):
+    if(self.time_since_update > 0):
       self.hit_streak = 0
     self.time_since_update += 1
     self.history.append(convert_x_to_bbox(self.kf.x))
@@ -134,22 +183,47 @@ class KalmanBoxTracker(object):
 def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
   """
   Assigns detections to tracked object (both represented as bounding boxes)
+  
+  Parameters
+  ----------
+  detections : list
+    
+  trackers : list
+    
+  iou_threshold : float
 
-  Returns 3 lists of matches, unmatched_detections and unmatched_trackers
+  Returns
+  -------
+  matches : numpy.array
+      shape=[num_matches, 2]
+  unmatched_detections : numpy.array
+      shape=[num_unmatched]
+      an array of the unmatched detection indexes
+  unmatched_trackers : numpy.array
+      shape=[num_unmatched, 5]
   """
+  num_detections = len(detections)
+  num_trakcers = len(trackers)
   if(len(trackers)==0):
-    return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
-  iou_matrix = np.zeros((len(detections),len(trackers)),dtype=np.float32)
+    return np.empty(shape=(0,2),dtype=int), \
+           np.arange(num_detections), \
+           np.empty(shape=(0,5),dtype=int)
 
+  # iou_matrix[i,j] = (det_{i}, track_{j})'s iou
+  iou_matrix = np.zeros(shape=(num_detections,num_trakcers),dtype=np.float32)
   for d,det in enumerate(detections):
     for t,trk in enumerate(trackers):
-      iou_matrix[d,t] = iou(det,trk)
-  matched_indices = linear_assignment(-iou_matrix)
+      iou_matrix[d,t] = iou(bb_test=det, bb_gt=trk)
+
+  # Hungarian Algorithm
+  # linear_assignment() return the minimum pairs
+  matched_indices = linear_assignment_.linear_assignment(-iou_matrix)
 
   unmatched_detections = []
   for d,det in enumerate(detections):
     if(d not in matched_indices[:,0]):
       unmatched_detections.append(d)
+
   unmatched_trackers = []
   for t,trk in enumerate(trackers):
     if(t not in matched_indices[:,1]):
@@ -158,22 +232,35 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
   #filter out matched with low IOU
   matches = []
   for m in matched_indices:
-    if(iou_matrix[m[0],m[1]]<iou_threshold):
+    if(iou_matrix[m[0],m[1]] < iou_threshold):
       unmatched_detections.append(m[0])
       unmatched_trackers.append(m[1])
     else:
       matches.append(m.reshape(1,2))
-  if(len(matches)==0):
-    matches = np.empty((0,2),dtype=int)
-  else:
-    matches = np.concatenate(matches,axis=0)
 
-  return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
+  if(len(matches)==0):
+    matches = np.empty(shape=(0,2),dtype=int)
+  else:
+    matches = np.concatenate(matches, axis=0)
+
+  return matches, \
+         np.array(unmatched_detections), \
+         np.array(unmatched_trackers)
 
 
 
 class Sort(object):
-  def __init__(self,max_age=1,min_hits=3):
+  """
+  Parameters
+  ----------
+  max_age : int
+    Tracks are terminated if they are not detected for `max_age` frames.
+  min_hits : int
+    a new tracker undergoes a probationary period where the target needs to be
+    eassociated with detecions to accumulate enough evidence
+    in order to prevent tracking of false positive.
+  """
+  def __init__(self,max_age=1, min_hits=3):
     """
     Sets key parameters for SORT
     """
@@ -182,18 +269,24 @@ class Sort(object):
     self.trackers = []
     self.frame_count = 0
 
-  def update(self,dets):
+  def update(self, dets):
     """
     Params:
       dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]
     Requires: this method must be called once for each frame even with empty detections.
     Returns the a similar array, where the last column is the object ID.
 
+    Parameters
+    ----------
+    dets : numpy.array
+        shape=(num_bbox, 4)
+        ax1 : [xmin, ymin, width, height]
+
     NOTE: The number of objects returned may differ from the number of detections provided.
     """
     self.frame_count += 1
     #get predicted locations from existing trackers.
-    trks = np.zeros((len(self.trackers),5))
+    trks = np.zeros(shape=(len(self.trackers),5))
     to_del = []
     ret = []
     for t,trk in enumerate(trks):
@@ -201,30 +294,42 @@ class Sort(object):
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
       if(np.any(np.isnan(pos))):
         to_del.append(t)
+    # remove rows including nan
     trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
     for t in reversed(to_del):
       self.trackers.pop(t)
-    matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets,trks)
 
-    #update matched trackers with assigned detections
+    matched, unmatched_dets, unmatched_trks = \
+        associate_detections_to_trackers(detections=dets, trackers=trks,
+                                         iou_threshold = 0.3)
+
+    # update matched trackers with assigned detections
+    # matched
     for t,trk in enumerate(self.trackers):
       if(t not in unmatched_trks):
         d = matched[np.where(matched[:,1]==t)[0],0]
         trk.update(dets[d,:][0])
 
-    #create and initialise new trackers for unmatched detections
+    # create and initialise new trackers for unmatched detections
+    # unmatched_trks
     for i in unmatched_dets:
-        trk = KalmanBoxTracker(dets[i,:]) 
+        trk = KalmanBoxTracker(bbox=dets[i,:]) 
         self.trackers.append(trk)
+
     i = len(self.trackers)
     for trk in reversed(self.trackers):
         d = trk.get_state()[0]
-        if((trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits)):
-          ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
+        if((trk.time_since_update < 1) \
+            and (trk.hit_streak >= self.min_hits \
+                 or self.frame_count <= self.min_hits)):
+          # +1 as MOT benchmark requires positive
+          ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1))
         i -= 1
-        #remove dead tracklet
+        # remove dead tracklet
+        # Tracks are terminated if they are not detected for `max_age` frames
         if(trk.time_since_update > self.max_age):
           self.trackers.pop(i)
+
     if(len(ret)>0):
       return np.concatenate(ret)
     return np.empty((0,5))
@@ -238,7 +343,9 @@ def parse_args():
 
 if __name__ == '__main__':
   # all train
-  sequences = ['PETS09-S2L1','TUD-Campus','TUD-Stadtmitte','ETH-Bahnhof','ETH-Sunnyday','ETH-Pedcross2','KITTI-13','KITTI-17','ADL-Rundle-6','ADL-Rundle-8','Venice-2']
+  #sequences = ['PETS09-S2L1','TUD-Campus','TUD-Stadtmitte','ETH-Bahnhof','ETH-Sunnyday','ETH-Pedcross2','KITTI-13','KITTI-17','ADL-Rundle-6','ADL-Rundle-8','Venice-2']
+  dataset_name = "MOT16-02"
+  sequences = ["data/raw/MOT16/train/{}/det".format(dataset_name)]
   args = parse_args()
   display = args.display
   phase = 'train'
@@ -246,9 +353,9 @@ if __name__ == '__main__':
   total_frames = 0
   colours = np.random.rand(32,3) #used only for display
   if(display):
-    if not os.path.exists('mot_benchmark'):
-      print('\n\tERROR: mot_benchmark link not found!\n\n    Create a symbolic link to the MOT benchmark\n    (https://motchallenge.net/data/2D_MOT_2015/#download). E.g.:\n\n    $ ln -s /path/to/MOT2015_challenge/2DMOT2015 mot_benchmark\n\n')
-      exit()
+    #if not os.path.exists('mot_benchmark'):
+    #  print('\n\tERROR: mot_benchmark link not found!\n\n    Create a symbolic link to the MOT benchmark\n    (https://motchallenge.net/data/2D_MOT_2015/#download). E.g.:\n\n    $ ln -s /path/to/MOT2015_challenge/2DMOT2015 mot_benchmark\n\n')
+    #  exit()
     plt.ion()
     fig = plt.figure() 
   
@@ -257,18 +364,22 @@ if __name__ == '__main__':
   
   for seq in sequences:
     mot_tracker = Sort() #create instance of the SORT tracker
-    seq_dets = np.loadtxt('data/%s/det.txt'%(seq),delimiter=',') #load detections
-    with open('output/%s.txt'%(seq),'w') as out_file:
+    #seq_dets = np.loadtxt('data/%s/det.txt'%(seq),delimiter=',') #load detections
+    seq_dets = np.loadtxt('%s/det.txt'%(seq),delimiter=',') #load detections
+    #with open('output/%s.txt'%(seq),'w') as out_file:
+    with open('output/%s.txt'%(dataset_name),'w') as out_file:
       print("Processing %s."%(seq))
       for frame in range(int(seq_dets[:,0].max())):
         frame += 1 #detection and frame numbers begin at 1
         dets = seq_dets[seq_dets[:,0]==frame,2:7]
-        dets[:,2:4] += dets[:,0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+        # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+        dets[:,2:4] += dets[:,0:2]
         total_frames += 1
 
         if(display):
           ax1 = fig.add_subplot(111, aspect='equal')
-          fn = 'mot_benchmark/%s/%s/img1/%06d.jpg'%(phase,seq,frame)
+          #fn = 'mot_benchmark/%s/%s/img1/%06d.jpg'%(phase,seq,frame)
+          fn = "data/raw/MOT16/train/{}/img1/{}.jpg".format(dataset_name,str(frame).zfill(6))
           im =io.imread(fn)
           ax1.imshow(im)
           plt.title(seq+' Tracked Targets')
